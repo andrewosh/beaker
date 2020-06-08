@@ -1,6 +1,7 @@
 import { parseDriveUrl } from '../../lib/urls'
 import { PassThrough, Transform } from 'stream'
 import parseRange from 'range-parser'
+import eos from 'end-of-stream'
 import once from 'once'
 import pump from 'pump'
 import * as logLib from '../logger'
@@ -24,6 +25,12 @@ const md = markdown({
 
 // exported api
 // =
+const streamCounters = new Map()
+setInterval(() => {
+  [...streamCounters].map(([k, v]) => {
+    console.log('stream:', { buffered: v.stream._readableState.buffered, ...v, stream: null })
+  })
+}, 5000)
 
 export function register (protocol) {
   protocol.registerStreamProtocol('hyper', protocolHandler)
@@ -306,15 +313,69 @@ export const protocolHandler = async function (request, respond) {
     if (request.method === 'HEAD') {
       respond({statusCode: 204, headers, data: intoStream('')})
     } else {
+      const stream = checkoutFS.session.drive.createReadStream(entry.path)
+
+      const id = Math.random()
+      const pause = stream.pause.bind(stream)
+      const resume = stream.resume.bind(stream)
+      const read = stream.read.bind(stream)
+      const removeListener = stream.removeListener.bind(stream)
+      let counters = { path: entry.path, stream, pauses: 0, resumes: 0, ended: false, reads: 0, listeners: [], removedListeners: [], history: [], headers }
+      streamCounters.set(id, counters) 
+      stream.removeListener = (name, listener) => {
+        counters.removedListeners.push(name)
+        return removeListener(name, listener)
+      }
+      stream.on('readable', () => {
+        counters.history.push('readable-' + stream._readableState.buffered)
+      })
+      stream.on('data', (data) => {
+        counters.history.push('data-' + data.length)
+      })
+      stream.pause()
+      stream.pause = () => {
+        counters.pauses++
+        return pause()
+      }
+      stream.resume = () => {
+        counters.resumes++
+        return resume()
+      }
+      stream.read = (size) => {
+        counters.reads++
+        counters.history.push('read-' + stream._readableState.buffered)
+        const buf = read(size)
+        counters.history.push('read-result-' + (buf && buf.length))
+        return buf
+      }
+      eos(stream, () => { counters.eos = true })
+      stream.once('end', () => { counters.ended = true })
+
+      // const collected = await collectStream(stream)
+
+      stream.on('newListener', (name) => {
+        counters.listeners.push(name)
+        counters.history.push('on-' + name)
+      })
       respond({
         statusCode,
         headers,
-        data: pump(
-          checkoutFS.session.drive.createReadStream(entry.path, range),
-          chunkLogger(entry.path, length)
-        )
+        data: stream
+        // data: intoStream(collected)
       })
     }
+  })
+}
+
+function collectStream (s) {
+  return new Promise(resolve => {
+    const bufs = []
+    s.on('data', d => {
+      bufs.push(d)
+    })
+    s.on('end', () => {
+      return resolve(Buffer.concat(bufs))
+    })
   })
 }
 
@@ -330,13 +391,9 @@ function chunkLogger (path, len) {
   var n = 0
   return new Transform({
     transform (chunk, encoding, callback) {
-      console.log(path, 'len', len, 'n', n, 'chunk', chunk.length)
+      console.log(path, 'len', len, 'offset', n, 'chunk', chunk.length)
       n += chunk.length
       return callback(null, chunk)
-      this.push(chunk)
-      n += chunk.length
-      if (len && n >= len) this.push(null)
-      callback()
     }
   })
 }
